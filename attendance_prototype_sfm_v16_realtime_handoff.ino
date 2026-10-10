@@ -86,6 +86,7 @@ const char* PUNCHES_PATH_DEFAULT = "";
 // ──────────────────────────────────────────────────────────────── tuneable ──
 #define SFM_CAPACITY      100        // hard limit of the module
 #define DEBOUNCE_MS      5000UL
+#define CARD_REMOVED_MS   500UL     // a held card can miss single polls; absent this long = removed
 #define FLUSH_RETRY_MS   30000UL
 #define LOG_LINES           60
 #define MAX_QUEUE_BYTES  (512UL * 1024UL)
@@ -176,6 +177,8 @@ String lastPunchLine = "-";
 String lastCardRef = "-";
 Pn532Reader nfc(PIN_SDA, PIN_SCL);
 bool cardArmed = true;
+uint32_t cardLastSeenAt = 0;
+uint8_t lastCardUid[10], lastCardUidLength = 0;
 
 String logBuf[LOG_LINES];
 int    logHead = 0;
@@ -828,9 +831,19 @@ void updateNfc() {
       logLine("PN532: communication lost (" + String(nfc.lastError()) + "); retrying every 10s");
       break;
     case Pn532Reader::Event::NoCard:
-      cardArmed = true; // require removal before the same held card can punch again
+      // Require removal before the same held card can punch again. One empty
+      // poll is not removal: a card at the edge of the field drops out briefly.
+      if (millis() - cardLastSeenAt >= CARD_REMOVED_MS) cardArmed = true;
       break;
     case Pn532Reader::Event::Card: {
+      // A different card is a new scan at once (quick hand-over in a queue);
+      // only the same card has to leave the field for CARD_REMOVED_MS first.
+      if (uidLength != lastCardUidLength || memcmp(uid, lastCardUid, uidLength) != 0) {
+        cardArmed = true;
+        memcpy(lastCardUid, uid, uidLength);
+        lastCardUidLength = uidLength;
+      }
+      cardLastSeenAt = millis();
       if (!cardArmed || fingerprintBusy() || bootButtonTracking) break;
       cardArmed = false;
       char ref[26], hex[21];
