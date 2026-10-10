@@ -1,5 +1,12 @@
-/* Fingerprint and RFID punch terminal, ESP32-C3 4 MB, default partition layout.
+/* Fingerprint and RFID punch terminal, ESP32-C3 4 MB.
+ * Partitions: partitions.csv beside this sketch (two 1.5 MB OTA app slots, 896 KB
+ * LittleFS). The core uses it automatically; select Partition Scheme "Custom" so the
+ * IDE size check matches. The default layout's 1.25 MB slots are too small.
+ * Upgrading a unit that runs a default-layout build: send its queued punches first;
+ * the filesystem moves and is formatted once on first boot. Going back to a
+ * default-layout build requires Erase All Flash.
  * GPIO21 SDA / GPIO6 SCL: PN532 + DS3231; GPIO5 TX / GPIO10 RX / GPIO4 touch: SFM.
+ * GPIO0 BCLK / GPIO1 LRC / GPIO7 DIN: MAX98357A voice feedback. GPIO20: relay, held off.
  * Punch API: cardRefCode (fingerprint ID or decimal RFID UID as a string), deviceCode,
  * eventType (1 IN, 0 OUT), eventTimestamp (UTC ISO8601 milliseconds).
  * Clock currently synchronizes over NTP; scans wait until the clock is valid.
@@ -27,6 +34,9 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
+#include <freertos/queue.h>
+#include <esp_partition.h>
+#include "VoiceFeedback.h"
 #include "deanex_prototype_secrets.h"
 
 // ─────────────────────────────────────────────────────────── configuration ──
@@ -65,10 +75,13 @@ const char* PUNCHES_PATH_DEFAULT = "";
 #define PIN_SCL          6   // PN532 + DS3231 SCL
 #define PIN_BOOT         9   // Dev-board BOOT button, active LOW
 #define PIN_LED          8   // status LED, active LOW per hardware diagnostic config
-#define PIN_RELAY       20   // unused; keep high impedance
+#define PIN_RELAY       20   // active HIGH; held off until door control exists
 #define PIN_FP_RX       10   // wired to the SFM's TX
 #define PIN_FP_TX        5   // wired to the SFM's RX
 #define PIN_FP_TOUCH     4   // SFM TOUCH_OUT, active HIGH
+#define PIN_I2S_BCLK     0   // MAX98357A BCLK
+#define PIN_I2S_WS       1   // MAX98357A LRC
+#define PIN_I2S_DIN      7   // MAX98357A DIN
 
 // ──────────────────────────────────────────────────────────────── tuneable ──
 #define SFM_CAPACITY      100        // hard limit of the module
@@ -82,6 +95,10 @@ const char* PUNCHES_PATH_DEFAULT = "";
 #define BOOT_SERVICE_HOLD_MS    3000UL
 #define BOOT_FACTORY_HOLD_MS   12000UL
 #define BOOT_QUEUED_RESET_HOLD_MS 20000UL
+#define VOICE_VOLUME          1.0f   // PCM amplitude 0..1; 8 ohm speaker tested clean at 1.0
+// LittleFS address in the default layout (default.csv), used by every build
+// that predates the partition address stored in NVS.
+#define LEGACY_FS_ADDRESS 0x290000UL
 
 #define QUEUE_FILE   "/punches-v2.jsonl"
 #define LEGACY_QUEUE_FILE "/queue.jsonl"
@@ -123,7 +140,8 @@ void onNtpSync(struct timeval*) { ntpTimeUpdated = true; }
 // override that reverts to this once its own timer elapses — the SFM ring
 // hardware does NOT auto-revert on its own, so we track this ourselves.
 bool serverOk = false;
-enum class PunchFeedback : uint8_t { Unknown, Pending, Accepted, Failed };
+// Saved: committed to the queue while WiFi is down; it uploads on reconnect.
+enum class PunchFeedback : uint8_t { Unknown, Pending, Accepted, Failed, Saved };
 volatile PunchFeedback punchFeedback = PunchFeedback::Unknown;
 bool fsReady = false;
 bool serviceMode = false;
@@ -140,6 +158,7 @@ uint32_t bootButtonLowSince = 0;
 volatile bool idleRefreshRequested = false;
 
 TaskHandle_t uploaderTaskHandle = nullptr;
+QueueHandle_t voiceQueue = nullptr;   // one slot: the newest pending phrase
 SemaphoreHandle_t queueMutex = nullptr;
 SemaphoreHandle_t networkMutex = nullptr;
 SemaphoreHandle_t logMutex = nullptr;
@@ -191,6 +210,8 @@ void handleClear();
 bool flushQueue(uint16_t timeoutMs = 5000);
 void requestImmediateUpload();
 void uploaderTask(void* parameter);
+void announce(bool granted);
+void voiceTask(void* parameter);
 void handleConfigGet();
 void handleConfigSet();
 bool requireServiceAccess();
@@ -338,8 +359,11 @@ void recordPunch(const char* ref, const char* source) {
   recent[slot][sizeof(recent[slot]) - 1] = '\0';
   seen[slot] = now;
   slot = (slot + 1) % 16;
-  punchFeedback = WiFi.status() == WL_CONNECTED ? PunchFeedback::Pending : PunchFeedback::Failed;
-  setSolid(punchFeedback == PunchFeedback::Pending ? SFM_RING_CYAN : SFM_RING_RED);
+  // Offline is not a failure: the punch is safe and waits for WiFi. Red stays
+  // reserved for scans that were refused, so it never accompanies "granted".
+  punchFeedback = WiFi.status() == WL_CONNECTED ? PunchFeedback::Pending : PunchFeedback::Saved;
+  setSolid(punchFeedback == PunchFeedback::Pending ? SFM_RING_CYAN : SFM_RING_YELLOW);
+  announce(true); // the punch is durable now; delivery is reported by the ring
   lastPunchLine = String(source) + " " + ref + (cfgEventType == 1 ? " IN" : " OUT") + " | " + timestamp;
   logLine("saved " + lastPunchLine + " (local " + String(millis() - startedAt) + "ms)");
   requestImmediateUpload();
@@ -395,7 +419,6 @@ void applyConfig(const DeviceConfig& cfg) {
   cfgWifiPass = cfg.wifiPass;
   cfgPunchesPath = cfg.punchesPath;
   cfgEventType = cfg.eventType;
-  pinMode(PIN_RELAY, INPUT);
   serverOk = false;
 }
 
@@ -589,6 +612,9 @@ void addSecurityHeaders() {
 
 // ═══════════════════════════════════════════════════════════════════ setup ══
 void setup() {
+  // Drive the relay off before anything else; the pin floats until here.
+  pinMode(PIN_RELAY, OUTPUT);
+  digitalWrite(PIN_RELAY, LOW);
   Serial.begin(115200);
   setenv("TZ", "UTC0", 1); tzset();
   queueMutex = xSemaphoreCreateMutex();
@@ -603,13 +629,24 @@ void setup() {
   Preferences bootPrefs;
   bootPrefs.begin("timestamp", false);
   bool fsWasInitialized = bootPrefs.getBool("fs_init", false);
+  // NVS survives a partition-layout change but the filesystem moves. Track
+  // where it was initialized so a new layout is formatted once instead of
+  // reading as a broken field filesystem. Builds without this key only ever
+  // used the default layout.
+  const esp_partition_t* fsPartition =
+      esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "spiffs");
+  uint32_t fsAddress = fsPartition ? fsPartition->address : 0;
+  uint32_t fsKnownAddress = bootPrefs.getUInt("fs_addr", fsWasInitialized ? LEGACY_FS_ADDRESS : 0);
+  bool fsLayoutChanged = fsWasInitialized && fsAddress && fsKnownAddress != fsAddress;
   fsReady = LittleFS.begin(false); // NEVER format automatically on a known field filesystem
-  if (!fsReady && !fsWasInitialized) {
-    // First manufacturing boot only: a brand-new partition may not have a
-    // filesystem yet. Once marked initialized, mount failure never formats.
+  if (!fsReady && (!fsWasInitialized || fsLayoutChanged)) {
+    // First manufacturing boot, or first boot on a new partition layout: the
+    // partition may not hold a filesystem yet. Otherwise mount failure never formats.
     if (LittleFS.format()) fsReady = LittleFS.begin(false);
+    if (fsReady && fsLayoutChanged) logLine("partition layout changed - filesystem formatted once");
   }
   if (fsReady && !fsWasInitialized) bootPrefs.putBool("fs_init", true);
+  if (fsReady && fsAddress && fsKnownAddress != fsAddress) bootPrefs.putUInt("fs_addr", fsAddress);
   bootPrefs.end();
   if (!syncPrimitivesReady) fsReady = false;
   if (!fsReady) {
@@ -720,6 +757,17 @@ void setup() {
       // handleWifi() wakes it on the first connected loop iteration. Avoid a
       // second queued notification and duplicate POST during startup.
     }
+  }
+
+  // Speech never gates attendance: without I2S the terminal runs silently.
+  voiceQueue = xQueueCreate(1, sizeof(uint8_t));
+  if (voiceQueue && VoiceFeedback::begin(PIN_I2S_BCLK, PIN_I2S_WS, PIN_I2S_DIN, VOICE_VOLUME) &&
+      xTaskCreate(voiceTask, "voice-feedback", 4096, nullptr, 2, nullptr) == pdPASS) {
+    logLine("voice feedback ready");
+  } else {
+    if (voiceQueue) { vQueueDelete(voiceQueue); voiceQueue = nullptr; }
+    VoiceFeedback::end();
+    logLine("! voice feedback unavailable - punches continue without speech");
   }
 
   setIdle();   // yellow until the first successful contact with the server
@@ -1177,6 +1225,27 @@ void uploaderTask(void* parameter) {
   }
 }
 
+// ══════════════════════════════════════════════════════════ voice feedback ══
+// Scan paths only queue the phrase; this task alone owns I2S, so the ~1.1 s
+// playback never stalls the reader, the web page or the uploader. A newer
+// decision replaces one that is still waiting instead of building a backlog.
+void announce(bool granted) {
+  if (!voiceQueue) return;
+  uint8_t phrase = granted ? 1 : 0;
+  xQueueOverwrite(voiceQueue, &phrase);
+}
+
+void voiceTask(void* parameter) {
+  (void)parameter;
+  bool failureLogged = false;
+  for (;;) {
+    uint8_t phrase;
+    if (xQueueReceive(voiceQueue, &phrase, portMAX_DELAY) != pdTRUE) continue;
+    bool played = phrase ? VoiceFeedback::playGranted() : VoiceFeedback::playDenied();
+    if (!played && !failureLogged) { logLine("! voice playback failed"); failureLogged = true; }
+  }
+}
+
 void makeUuid(char* out) {
   uint8_t b[16];
   for (int i = 0; i < 16; i++) b[i] = esp_random() & 0xFF;
@@ -1206,7 +1275,8 @@ void flash(uint8_t color, uint16_t ms) {
 }
 
 // Idle color reflects whether the last attempt to reach the server
-// succeeded — blue if yes, yellow if no or not yet tried.
+// succeeded — blue if yes, red if it failed, yellow if not yet tried or
+// a punch is saved offline.
 void setIdle() {
   setSolid(punchFeedback == PunchFeedback::Accepted ? SFM_RING_BLUE :
            punchFeedback == PunchFeedback::Failed ? SFM_RING_RED :
@@ -1225,6 +1295,7 @@ void reject(const String& why) {
   punchFeedback = PunchFeedback::Failed;
   pendingRevertAt = 0;
   setSolid(SFM_RING_RED);
+  announce(false);
 }
 
 // ═════════════════════════════════════════════════════════════ device config ══
