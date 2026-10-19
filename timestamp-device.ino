@@ -619,6 +619,7 @@ void setup() {
   pinMode(PIN_RELAY, OUTPUT);
   digitalWrite(PIN_RELAY, LOW);
   Serial.begin(115200);
+  Serial.setTxTimeoutMs(0); // USB diagnostics must never hold up the terminal or sensor polling.
   setenv("TZ", "UTC0", 1); tzset();
   queueMutex = xSemaphoreCreateMutex();
   networkMutex = xSemaphoreCreateMutex();
