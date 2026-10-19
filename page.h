@@ -67,7 +67,7 @@ el('touch').textContent=s.fingerTouch?'Finger touching':'Waiting for finger';
 el('fingerMessage').textContent=s.fingerMessage;el('fingerCount').textContent=s.fingerCount<0?'—':s.fingerCount;
 el('fingerId').textContent=s.fingerId||'—';el('enrolledId').textContent=s.enrolledId||'—';
 el('enroll').disabled=enrollRequest||!s.canEnroll;el('cancelEnroll').hidden=!s.enrolling;
-status('serverStatus',s.punchFeedback===2?'Accepted':s.punchFeedback===3?'Failed':s.punchFeedback===1?'Sending':'Not yet sent',s.punchFeedback===2);status('queue',s.queue<0?'Unavailable':String(s.queue),s.queue===0);status('storage',s.fsReady?'Ready':'FAULT',s.fsReady);
+status('serverStatus',s.punchFeedback===2?'Accepted':s.punchFeedback===3?'Failed':s.punchFeedback===1?'Sending':s.punchFeedback===4?'Saved, waiting for WiFi':'Not yet sent',s.punchFeedback===2);status('queue',s.queue<0?'Unavailable':String(s.queue),s.queue===0);status('storage',s.fsReady?'Ready':'FAULT',s.fsReady);
 el('legacy').hidden=s.legacyQueue===0;el('legacyCount').textContent=s.legacyQueue<0?'unavailable':s.legacyQueue;el('lastPunch').textContent=s.lastPunch;
 if(!loaded){el('cPunchesPath').value=s.punchesPath;el('cDeviceId').value=s.deviceId;el('cWifiSsid').value=s.wifiSsid;el('cEventType').value=s.eventType===0||s.eventType===1?String(s.eventType):'';loaded=true;}
 el('tokenState').textContent=s.tokenSet?'(set)':'(empty)';el('wifiPassState').textContent=s.wifiPassSet?'(set)':'(empty)';el('apSsid').textContent=s.apSsid;el('apIp').textContent=s.apIp;
