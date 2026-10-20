@@ -638,7 +638,11 @@ void setup() {
   pinMode(PIN_RELAY, OUTPUT);
   digitalWrite(PIN_RELAY, LOW);
   Serial.begin(115200);
-  Serial.setTxTimeoutMs(0); // USB diagnostics must never hold up the terminal or sensor polling.
+  // USB diagnostics must never hold up the terminal or sensor polling. Not 0:
+  // in Arduino-ESP32 3.3.x HWCDC counts the timeout down from tx_timeout_ms,
+  // so 0 wraps around and a write waits forever while a PC is attached but
+  // no terminal reads. 1 ms gives up at once and drops further output.
+  Serial.setTxTimeoutMs(1);
   setenv("TZ", "UTC0", 1); tzset();
   queueMutex = xSemaphoreCreateMutex();
   networkMutex = xSemaphoreCreateMutex();
