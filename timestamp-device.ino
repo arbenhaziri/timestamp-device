@@ -96,6 +96,8 @@ const char* PUNCHES_PATH_DEFAULT = "";
 #define BOOT_SERVICE_HOLD_MS    3000UL
 #define BOOT_FACTORY_HOLD_MS   12000UL
 #define BOOT_QUEUED_RESET_HOLD_MS 20000UL
+#define ROUTER_JOIN_MS         8000UL   // boot-time router join before the setup AP opens
+#define IDLE_CONNECTION_MS      500UL   // web connection without a request is dropped
 #define VOICE_VOLUME          1.0f   // PCM amplitude 0..1; 8 ohm speaker tested clean at 1.0
 // LittleFS address in the default layout (default.csv), used by every build
 // that predates the partition address stored in NVS.
@@ -147,6 +149,7 @@ volatile PunchFeedback punchFeedback = PunchFeedback::Unknown;
 bool fsReady = false;
 bool serviceMode = false;
 bool apRunning = false;
+uint32_t routerJoinDeadline = 0;   // nonzero while the boot-time router join is pending
 uint32_t serviceUntil = 0;
 String csrfToken;
 uint32_t pendingRevertAt = 0;
@@ -165,7 +168,22 @@ SemaphoreHandle_t networkMutex = nullptr;
 SemaphoreHandle_t logMutex = nullptr;
 bool syncPrimitivesReady = false;
 
-WebServer server(80);
+// The stock server handles one connection at a time and waits up to 5 s for
+// the request on each. Browsers open spare connections in advance; an idle one
+// would hold the page back, so it is dropped after IDLE_CONNECTION_MS.
+class TerminalWebServer : public WebServer {
+ public:
+  using WebServer::WebServer;
+  void handleClient() override {
+    if (_currentStatus == HC_WAIT_READ && _currentClient && !_currentClient.available() &&
+        millis() - _statusChange > IDLE_CONNECTION_MS) {
+      _currentClient.stop();
+      _currentStatus = HC_NONE;
+    }
+    WebServer::handleClient();
+  }
+};
+TerminalWebServer server(80);
 
 // Kept as long-lived globals rather than constructed fresh per-call —
 // WiFiClientSecure is a heavier object, and reusing one instance is the
@@ -236,6 +254,7 @@ bool validateConfig(const DeviceConfig& cfg, String& error);
 void applyConfig(const DeviceConfig& cfg);
 void startServiceMode();
 void updateServiceMode();
+void updateRouterJoin();
 void updateBootButton();
 void performPhysicalFactoryReset(bool allowQueuedPunches);
 bool physicalPresence();
@@ -720,16 +739,10 @@ void setup() {
     // network you control; this unit may end up on any network, and a
     // hardcoded address would silently be wrong on someone else's subnet.
     WiFi.begin(cfgWifiSsid.c_str(), cfgWifiPass.c_str());
-    uint32_t t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) delay(50);
-
-    if (WiFi.status() == WL_CONNECTED) {
-      logLine("wifi ok — http://" + WiFi.localIP().toString());
-      configTime(0, 0, "pool.ntp.org", "time.google.com");
-    } else {
-      logLine("could not join '" + cfgWifiSsid + "' — check the password in Device configuration");
-      startServiceMode();
-    }
+    // The join continues in the background so the sensors, voice and web
+    // server start now. updateRouterJoin() opens the setup AP if the router
+    // has not answered in time; handleWifi() reports a successful join.
+    routerJoinDeadline = millis() + ROUTER_JOIN_MS;
   }
 
   const char* headers[] = {"X-CSRF-Token", "Content-Length"};
@@ -782,6 +795,7 @@ void setup() {
 void loop() {
   server.handleClient();
   handleWifi();
+  updateRouterJoin();
   updateServiceMode();
   updateBootButton();
   updateFingerprint();
@@ -1487,6 +1501,17 @@ void handleWifi() {
   }
   // Arduino-ESP32 already retries reconnectable station failures. A second
   // manual attempt collides with the active association and logs an error.
+}
+
+// Boot-time router join: the setup AP stays off while the saved router may
+// still answer, and opens once ROUTER_JOIN_MS has passed without a connection.
+void updateRouterJoin() {
+  if (!routerJoinDeadline) return;
+  if (WiFi.status() == WL_CONNECTED) { routerJoinDeadline = 0; return; }
+  if ((int32_t)(millis() - routerJoinDeadline) < 0) return;
+  routerJoinDeadline = 0;
+  logLine("could not join '" + cfgWifiSsid + "' — check the password in Device configuration");
+  startServiceMode();
 }
 
 // Call only while Wire is stopped. pinMode() on an active I2C pin detaches
